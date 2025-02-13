@@ -136,7 +136,7 @@ functions, in case multiple step function templates match. A typical
 pattern is to provide a specific function for a specific step type,
 such as joins and give it a precedence of `0`. Then another catch-all
 can be defined with `@steps(2, ['all'])`. As the result, the special
-function is applied to joins and the catch all function for all other
+function is applied to joins and the catch-all function for all other
 steps.
 
 The second argument gives a list of *qualifiers* specifying which
@@ -188,11 +188,11 @@ to get an idea of the syntax.
 
 #### Checkers
 
-Currently the test harness exercises two types of user interfaces:
+Currently, the test harness exercises two types of user interfaces:
 The command line interface, defined in `cli_check.py`, and the Python
 API, defined in `mli_check.py`.
 
-Currently you can use these checkers to assert values of data artifacts
+Currently, you can use these checkers to assert values of data artifacts
 or log output. If you want to add test for new type of functionality
 in the CLI and/or the Python API, you should add a new method in
 the `MetaflowCheck` base class and corresponding implementations in
@@ -227,16 +227,6 @@ PYTHONPATH=`pwd`/../../ python run_tests.py --debug --contexts dev-local --graph
 ```
 
 This chooses a single context, a single graph, and a single test. If you are developing a new test, this is the fastest way to test the test.
-
-### Coverage report
-
-The test harness uses the `coverage` package in Python to produce a test
-coverage report. By default, you can find a comprehensive test coverage
-report in the `coverage` directory after the test harness has finished.
-
-After you have developed a new feature in Metaflow, use the line-by-line
-coverage report to confirm that all lines related the new feature are
-touched by the tests.
 
 
 

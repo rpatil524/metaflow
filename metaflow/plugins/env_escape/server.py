@@ -36,6 +36,7 @@ from .consts import (
     OP_GETVAL,
     OP_SETVAL,
     OP_INIT,
+    OP_SUBCLASSCHECK,
     VALUE_LOCAL,
     VALUE_REMOTE,
     CONTROL_GETEXPORTS,
@@ -53,20 +54,35 @@ from .override_decorators import (
     RemoteExceptionSerializer,
 )
 from .exception_transferer import dump_exception
-from .utils import get_methods
+from .utils import get_methods, get_canonical_name
 
 BIND_TIMEOUT = 0.1
 BIND_RETRY = 1
 
 
 class Server(object):
-    def __init__(self, max_pickle_version, config_dir):
-
+    def __init__(self, config_dir, max_pickle_version):
         self._max_pickle_version = data_transferer.defaultProtocol = max_pickle_version
-        sys.path.append(config_dir)
-        mappings = importlib.import_module("server_mappings")
-        override_module = importlib.import_module("overrides")
-        sys.path = sys.path[1:]
+        try:
+            mappings = importlib.import_module(".server_mappings", package=config_dir)
+        except Exception as e:
+            raise RuntimeError(
+                "Cannot import server_mappings from '%s': %s" % (sys.path[0], str(e))
+            )
+        try:
+            # Import module as a relative package to make sure that it is consistent
+            # with how the client does it -- this enables us to do the same type of
+            # relative imports in overrides
+            override_module = importlib.import_module(".overrides", package=config_dir)
+            override_values = override_module.__dict__.values()
+        except ImportError:
+            # We ignore so the file can be non-existent if not needed
+            override_values = []
+        except Exception as e:
+            raise RuntimeError(
+                "Cannot import overrides from '%s': %s" % (sys.path[0], str(e))
+            )
+
         self._aliases = {}
         self._known_classes, a1 = self._flatten_dict(mappings.EXPORTED_CLASSES)
         self._class_types_to_names = {v: k for k, v in self._known_classes.items()}
@@ -83,51 +99,78 @@ class Server(object):
         # We will also proxy functions from objects as needed. This is useful
         # for defaultdict for example since the `default_factory` function is a
         # lambda that needs to be transferred.
-        self._class_types_to_names[type(lambda x: x)] = 'function'
+        self._class_types_to_names[type(lambda x: x)] = "function"
 
         # Update all alias information
         for base_name, aliases in itertools.chain(
-                a1.items(), a2.items(), a3.items(), a4.items()):
+            a1.items(), a2.items(), a3.items(), a4.items()
+        ):
             for alias in aliases:
                 a = self._aliases.setdefault(alias, base_name)
                 if a != base_name:
+                    # Technically we could have a that aliases b and b that aliases c
+                    # and then a that aliases c. This would error out in that case
+                    # even though it is valid. It is easy for the user to get around
+                    # this by listing aliases in the same order so we don't support
+                    # it for now.
                     raise ValueError(
-                        "%s is an alias to both %s and %s" % (alias, base_name, a))
+                        "%s is an alias to both %s and %s -- make sure all aliases "
+                        "are listed in the same order" % (alias, base_name, a)
+                    )
+
+        # Detect circular aliases. If a user lists ("a", "b") and then ("b", "a"), we
+        # will have an entry in aliases saying b is an alias for a and a is an alias
+        # for b which is a recipe for disaster since we no longer have a cannonical name
+        # for things.
+        for alias, base_name in self._aliases.items():
+            if base_name in self._aliases:
+                raise ValueError(
+                    "%s and %s are circular aliases -- make sure all aliases "
+                    "are listed in the same order" % (alias, base_name)
+                )
 
         # Determine if we have any overrides
         self._overrides = {}
         self._getattr_overrides = {}
         self._setattr_overrides = {}
         self._exception_serializers = {}
-        for override in override_module.__dict__.values():
+        for override in override_values:
             if isinstance(override, (RemoteAttrOverride, RemoteOverride)):
                 for obj_name, obj_funcs in override.obj_mapping.items():
+                    canonical_name = get_canonical_name(obj_name, self._aliases)
+                    obj_type = self._known_classes.get(
+                        canonical_name, self._proxied_types.get(obj_name)
+                    )
+                    if obj_type is None:
+                        raise ValueError(
+                            "%s does not refer to a proxied or exported type" % obj_name
+                        )
                     if isinstance(override, RemoteOverride):
-                        override_dict = self._overrides.setdefault(
-                            self._known_classes[obj_name], {}
-                        )
+                        override_dict = self._overrides.setdefault(obj_type, {})
                     elif override.is_setattr:
-                        override_dict = self._setattr_overrides.setdefault(
-                            self._known_classes[obj_name], {}
-                        )
+                        override_dict = self._setattr_overrides.setdefault(obj_type, {})
                     else:
-                        override_dict = self._getattr_overrides.setdefault(
-                            self._known_classes[obj_name], {}
-                        )
+                        override_dict = self._getattr_overrides.setdefault(obj_type, {})
                     if isinstance(obj_funcs, str):
                         obj_funcs = (obj_funcs,)
                     for name in obj_funcs:
                         if name in override_dict:
                             raise ValueError(
-                                "%s was already overriden for %s" % (name, obj_name)
+                                "%s was already overridden for %s" % (name, obj_name)
                             )
                         override_dict[name] = override.func
             elif isinstance(override, RemoteExceptionSerializer):
+                canonical_name = get_canonical_name(override.class_path, self._aliases)
+                if canonical_name not in self._known_exceptions:
+                    raise ValueError(
+                        "%s does not refer to an exported exception"
+                        % override.class_path
+                    )
                 if override.class_path in self._exception_serializers:
                     raise ValueError(
                         "%s exception serializer already defined" % override.class_path
                     )
-                self._exception_serializers[override.class_path] = override.serializer
+                self._exception_serializers[canonical_name] = override.serializer
 
         # Process the exceptions making sure we have all the ones we need and building a
         # topologically sorted list for the client to instantiate
@@ -136,12 +179,13 @@ class Server(object):
         parent_to_child = {}
 
         for ex_name, ex_cls in self._known_exceptions.items():
+            ex_name_canonical = get_canonical_name(ex_name, self._aliases)
             parents = []
             for base in ex_cls.__mro__[1:]:
                 if base is object:
                     raise ValueError(
-                        "Exported exceptions not rooted in a builtin exception are not supported: %s"
-                        % ex_name
+                        "Exported exceptions not rooted in a builtin exception "
+                        "are not supported: %s." % ex_name
                     )
                 if base.__module__ == "builtins":
                     # We found our base exception
@@ -149,17 +193,19 @@ class Server(object):
                     break
                 else:
                     fqn = ".".join([base.__module__, base.__name__])
-                    if fqn in self._known_exceptions:
-                        parents.append(fqn)
-                        children = parent_to_child.setdefault(fqn, [])
-                        children.append(ex_name)
+                    canonical_fqn = get_canonical_name(fqn, self._aliases)
+                    if canonical_fqn in self._known_exceptions:
+                        parents.append(canonical_fqn)
+                        children = parent_to_child.setdefault(canonical_fqn, [])
+                        children.append(ex_name_canonical)
                     else:
                         raise ValueError(
                             "Exported exception %s has non exported and non builtin parent "
-                            "exception: %s" % (ex_name, fqn)
+                            "exception: %s (%s). Known exceptions: %s."
+                            % (ex_name, fqn, canonical_fqn, str(self._known_exceptions))
                         )
-            name_to_parent_count[ex_name] = len(parents) - 1
-            name_to_parents[ex_name] = parents
+            name_to_parent_count[ex_name_canonical] = len(parents) - 1
+            name_to_parents[ex_name_canonical] = parents
 
         # We now form the exceptions and put them in self._known_exceptions in
         # the proper order (topologically)
@@ -210,6 +256,7 @@ class Server(object):
             OP_GETVAL: self._handle_getval,
             OP_SETVAL: self._handle_setval,
             OP_INIT: self._handle_init,
+            OP_SUBCLASSCHECK: self._handle_subclasscheck,
         }
 
         self._local_objects = {}
@@ -247,6 +294,7 @@ class Server(object):
     def encode_exception(self, ex_type, ex, trace_back):
         try:
             full_name = "%s.%s" % (ex_type.__module__, ex_type.__name__)
+            get_canonical_name(full_name, self._aliases)
             serializer = self._exception_serializers.get(full_name)
         except AttributeError:
             # Ignore if no __module__ for example -- definitely not something we built
@@ -254,7 +302,9 @@ class Server(object):
         extra_content = None
         if serializer is not None:
             extra_content = serializer(ex)
-        return dump_exception(self._datatransferer, ex_type, ex, trace_back, extra_content)
+        return dump_exception(
+            self._datatransferer, ex_type, ex, trace_back, extra_content
+        )
 
     def decode(self, json_obj):
         # This decodes an object that was transferred in
@@ -455,10 +505,25 @@ class Server(object):
             raise ValueError("Unknown class %s" % class_name)
         return class_type(*args, **kwargs)
 
+    def _handle_subclasscheck(self, target, class_name, otherclass_name, reverse=False):
+        class_type = self._known_classes.get(class_name)
+        if class_type is None:
+            raise ValueError("Unknown class %s" % class_name)
+        try:
+            sub_module, sub_name = otherclass_name.rsplit(".", 1)
+            __import__(sub_module, None, None, "*")
+        except Exception:
+            sub_module = None
+        if sub_module is None:
+            return False
+        if reverse:
+            return issubclass(class_type, getattr(sys.modules[sub_module], sub_name))
+        return issubclass(getattr(sys.modules[sub_module], sub_name), class_type)
+
 
 if __name__ == "__main__":
     max_pickle_version = int(sys.argv[1])
     config_dir = sys.argv[2]
     socket_path = sys.argv[3]
-    s = Server(max_pickle_version, config_dir)
+    s = Server(config_dir, max_pickle_version)
     s.serve(path=socket_path)

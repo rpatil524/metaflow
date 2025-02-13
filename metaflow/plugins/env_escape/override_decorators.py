@@ -41,7 +41,7 @@ class RemoteAttrOverride(AttrOverride):
 def local_override(obj_mapping):
     if not isinstance(obj_mapping, dict):
         raise ValueError(
-            "@local_override takes a dictionary: <class name> -> [<overriden method>]"
+            "@local_override takes a dictionary: <class name> -> [<overridden method>]"
         )
 
     def _wrapped(func):
@@ -53,7 +53,7 @@ def local_override(obj_mapping):
 def local_getattr_override(obj_mapping):
     if not isinstance(obj_mapping, dict):
         raise ValueError(
-            "@local_getattr_override takes a dictionary: <class name> -> [<overriden attribute>]"
+            "@local_getattr_override takes a dictionary: <class name> -> [<overridden attribute>]"
         )
 
     def _wrapped(func):
@@ -65,7 +65,7 @@ def local_getattr_override(obj_mapping):
 def local_setattr_override(obj_mapping):
     if not isinstance(obj_mapping, dict):
         raise ValueError(
-            "@local_setattr_override takes a dictionary: <class name> -> [<overriden attribute>]"
+            "@local_setattr_override takes a dictionary: <class name> -> [<overridden attribute>]"
         )
 
     def _wrapped(func):
@@ -77,7 +77,7 @@ def local_setattr_override(obj_mapping):
 def remote_override(obj_mapping):
     if not isinstance(obj_mapping, dict):
         raise ValueError(
-            "@remote_override takes a dictionary: <class name> -> [<overriden method>]"
+            "@remote_override takes a dictionary: <class name> -> [<overridden method>]"
         )
 
     def _wrapped(func):
@@ -89,7 +89,7 @@ def remote_override(obj_mapping):
 def remote_getattr_override(obj_mapping):
     if not isinstance(obj_mapping, dict):
         raise ValueError(
-            "@remote_getattr_override takes a dictionary: <class name> -> [<overriden attribute>]"
+            "@remote_getattr_override takes a dictionary: <class name> -> [<overridden attribute>]"
         )
 
     def _wrapped(func):
@@ -101,7 +101,7 @@ def remote_getattr_override(obj_mapping):
 def remote_setattr_override(obj_mapping):
     if not isinstance(obj_mapping, dict):
         raise ValueError(
-            "@remote_setattr_override takes a dictionary: <class name> -> [<overriden attribute>]"
+            "@remote_setattr_override takes a dictionary: <class name> -> [<overridden attribute>]"
         )
 
     def _wrapped(func):
@@ -110,18 +110,18 @@ def remote_setattr_override(obj_mapping):
     return _wrapped
 
 
-class LocalException(object):
-    def __init__(self, class_path, wrapped_class):
+class LocalExceptionDeserializer(object):
+    def __init__(self, class_path, deserializer):
         self._class_path = class_path
-        self._class = wrapped_class
+        self._deserializer = deserializer
 
     @property
     def class_path(self):
         return self._class_path
 
     @property
-    def wrapped_class(self):
-        return self._class
+    def deserializer(self):
+        return self._deserializer
 
 
 class RemoteExceptionSerializer(object):
@@ -138,9 +138,9 @@ class RemoteExceptionSerializer(object):
         return self._serializer
 
 
-def local_exception(class_path):
-    def _wrapped(cls):
-        return LocalException(class_path, cls)
+def local_exception_deserialize(class_path):
+    def _wrapped(func):
+        return LocalExceptionDeserializer(class_path, func)
 
     return _wrapped
 

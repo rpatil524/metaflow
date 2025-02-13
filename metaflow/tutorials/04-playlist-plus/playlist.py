@@ -9,8 +9,8 @@ def get_python_version():
 
     """
     import platform
-    versions = {'2' : '2.7.15',
-                '3' : '3.7.3'}
+
+    versions = {"2": "2.7.15", "3": "3.9.10"}
     return versions[platform.python_version_tuple()[0]]
 
 
@@ -23,7 +23,7 @@ class PlayListFlow(FlowSpec):
 
     The flow performs the following steps:
 
-    1) Load the genre specific statistics from the MovieStatsFlow.
+    1) Load the genre-specific statistics from the MovieStatsFlow.
     2) In parallel branches:
        - A) Build a playlist from the top films in the requested genre.
        - B) Choose a bonus movie that has the closest string edit distance to
@@ -31,29 +31,28 @@ class PlayListFlow(FlowSpec):
     3) Join the two to create a movie playlist and display it.
 
     """
-    genre = Parameter('genre',
-                      help="Filter movies for a particular genre.",
-                      default='Sci-Fi')
 
-    hint = Parameter('hint',
-                     help="Give a hint to the bonus movie algorithm.",
-                     default='Metaflow Release')
+    genre = Parameter(
+        "genre", help="Filter movies for a particular genre.", default="Sci-Fi"
+    )
 
-    recommendations = Parameter('recommendations',
-                                help="The number of movies recommended for "
-                                "the playlist.",
-                                default=5)
+    hint = Parameter(
+        "hint",
+        help="Give a hint to the bonus movie algorithm.",
+        default="Metaflow Release",
+    )
 
-    @conda(libraries={'pandas' : '0.24.2'})
+    recommendations = Parameter(
+        "recommendations",
+        help="The number of movies recommended for the playlist.",
+        default=5,
+    )
+
     @step
     def start(self):
         """
         Use the Metaflow client to retrieve the latest successful run from our
         MovieStatsFlow and assign them as data artifacts in this flow.
-
-        This step uses 'conda' to isolate the environment. This step will
-        always use pandas==0.24.2 regardless of what is installed on the
-        system.
 
         """
         # Load the analysis from the MovieStatsFlow.
@@ -63,12 +62,12 @@ class PlayListFlow(FlowSpec):
         print("Using metadata provider: %s" % get_metadata())
 
         # Load the analysis from the MovieStatsFlow.
-        run = Flow('MovieStatsFlow').latest_successful_run
+        run = Flow("MovieStatsFlow").latest_successful_run
         print("Using analysis from '%s'" % str(run))
 
         # Get the dataframe from the start step before we sliced into into
-        # genre specific dataframes.
-        self.dataframe = run['start'].task.data.dataframe
+        # genre-specific dataframes.
+        self.dataframe = run["start"].task.data.dataframe
 
         # Also grab the summary statistics.
         self.genre_stats = run.data.genre_stats
@@ -76,7 +75,7 @@ class PlayListFlow(FlowSpec):
         # Compute our two recommendation types in parallel.
         self.next(self.bonus_movie, self.genre_movies)
 
-    @conda(libraries={'editdistance': '0.5.3', 'pandas' : '0.24.2'})
+    @conda(libraries={"editdistance": "0.5.3"})
     @step
     def bonus_movie(self):
         """
@@ -86,9 +85,7 @@ class PlayListFlow(FlowSpec):
         This step uses 'conda' to isolate the environment. Note that the
         package 'editdistance' need not be installed in your python
         environment.
-
         """
-        import pandas
         import editdistance
 
         # Define a helper function to compute the similarity between two
@@ -96,27 +93,24 @@ class PlayListFlow(FlowSpec):
         def _edit_distance(movie_title):
             return editdistance.eval(self.hint, movie_title)
 
-
         # Compute the distance and take the argmin to find the closest title.
-        distance = self.dataframe['movie_title'].apply(_edit_distance)
-        index = distance.idxmin()
-        self.bonus = (self.dataframe['movie_title'].values[index],
-                      self.dataframe['genres'].values[index])
+        distance = [
+            _edit_distance(movie_title) for movie_title in self.dataframe["movie_title"]
+        ]
+        index = distance.index(min(distance))
+        self.bonus = (
+            self.dataframe["movie_title"][index],
+            self.dataframe["genres"][index],
+        )
 
         self.next(self.join)
 
-    @conda(libraries={'pandas' : '0.24.2'})
     @step
     def genre_movies(self):
         """
         Select the top performing movies from the use specified genre.
-
-        This step uses 'conda' to isolate the environment. This step will
-        always use pandas==0.24.2 regardless of what is installed on the
-        system.
-
         """
-        import pandas
+
         from random import shuffle
 
         # For the genre of interest, generate a potential playlist using only
@@ -124,12 +118,14 @@ class PlayListFlow(FlowSpec):
         genre = self.genre.lower()
         if genre not in self.genre_stats:
             self.movies = []
-
         else:
-            df = self.genre_stats[genre]['dataframe']
-            quartiles = self.genre_stats[genre]['quartiles']
-            selector = df['gross'] >= quartiles[-1]
-            self.movies = list(df[selector]['movie_title'])
+            df = self.genre_stats[genre]["dataframe"]
+            quartiles = self.genre_stats[genre]["quartiles"]
+            self.movies = [
+                df["movie_title"][i]
+                for i, g in enumerate(df["gross"])
+                if g >= quartiles[-1]
+            ]
 
         # Shuffle the content.
         shuffle(self.movies)
@@ -139,7 +135,7 @@ class PlayListFlow(FlowSpec):
     @step
     def join(self, inputs):
         """
-        Join our parallel branches and merge results,
+        Join our parallel branches and merge results.
 
         """
         self.playlist = inputs.genre_movies.movies
@@ -163,5 +159,5 @@ class PlayListFlow(FlowSpec):
         print("Bonus Pick: '%s' from '%s'" % (self.bonus[0], self.bonus[1]))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     PlayListFlow()

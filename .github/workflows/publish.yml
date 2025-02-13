@@ -3,87 +3,41 @@ on:
   release:
     types: [published]
 jobs:
-  test:
-    name: ${{ matrix.lang }} tests on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        lang: [Python, R]
-
-    steps:
-    - uses: actions/checkout@v2
-
-    - name: Set up Python 2.x
-      if: matrix.lang == 'Python'
-      uses: actions/setup-python@v1
-      with:
-        python-version: '2.x'
-
-    - name: Install Python 2.x dependencies
-      if: matrix.lang == 'Python'
-      run: |
-        python2 -m pip install --upgrade pip
-        python2 -m pip install tox
-
-    - name: Set up Python 3.7
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.7'
-
-    - name: Install Python 3.x dependencies
-      run: |
-        python3 -m pip install --upgrade pip
-        python3 -m pip install tox numpy
-    
-    - name: Set up R 3.6
-      if: matrix.lang == 'R'
-      uses: r-lib/actions/setup-r@v1
-      with:
-        r-version: '3.6.3' 
-    
-    - name: Install R 3.6 system dependencies
-      if: matrix.lang == 'R' && matrix.os == 'ubuntu-latest'
-      run: sudo apt-get update; sudo apt-get install -y libcurl4-openssl-dev qpdf libgit2-dev
-
-    - name: Install R 3.6 Rlang dependencies
-      if: matrix.lang == 'R'
-      run: |
-        python3 -m pip install . 
-        Rscript -e 'install.packages("devtools", repos="https://cloud.r-project.org", Ncpus=8)'
-        Rscript -e 'devtools::install_deps("R", dependencies=TRUE, repos="https://cloud.r-project.org", upgrade="default")'
-        R CMD INSTALL R
-        Rscript -e 'install.packages(c("data.table", "caret", "glmnet", "Matrix", "rjson"), repos="https://cloud.r-project.org", Ncpus=8)'   
-
-    - name: Execute R tests
-      if: matrix.lang == 'R'
-      run: |
-        cd R/tests
-        Rscript run_tests.R
-
-    - name: Execute Python tests
-      if: matrix.lang == 'python'
-      run: tox
-
+  test: 
+    uses: './.github/workflows/test.yml'
+  test-stubs:
+    uses: './.github/workflows/test-stubs.yml'
   deploy:
-    needs: test
+    needs: [test, test-stubs]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0
     - name: Set up Python 3.x
-      uses: actions/setup-python@v1
+      uses: actions/setup-python@152ba7c4dd6521b8e9c93f72d362ce03bf6c4f20 # v1.2.3
       with:
         python-version: '3.x'
     - name: Install Python 3.x dependencies
       run: |
         python3 -m pip install --upgrade pip
         pip3 install setuptools wheel twine
-    - name: Build package
+    - name: Install metaflow
+      run: pip install .
+    - name: Generate Stubs
+      run: cd ./stubs && rm -rf metaflow-stubs/ && python -c "from metaflow.cmd.develop.stub_generator import StubGenerator; StubGenerator('./metaflow-stubs').write_out()" && cd -
+    - name: Build metaflow package
       run: |
         python3 setup.py sdist bdist_wheel --universal
-    - name: Publish package
-      uses: pypa/gh-action-pypi-publish@master
+    - name: Build metaflow-stubs package
+      run: |
+        cd ./stubs && python3 setup.py sdist bdist_wheel --universal && cd -
+    - name: Publish metaflow-stubs package
+      uses: pypa/gh-action-pypi-publish@2f6f737ca5f74c637829c0f5c3acd0e29ea5e8bf #v1.8.11
+      with:
+        user: __token__
+        password: ${{ secrets.pypi_stubs_token }}
+        packages-dir: ./stubs/dist
+    - name: Publish metaflow package
+      uses: pypa/gh-action-pypi-publish@2f6f737ca5f74c637829c0f5c3acd0e29ea5e8bf #v1.8.11
       with:
         user: __token__
         password: ${{ secrets.pypi_password }}
-

@@ -1,5 +1,6 @@
 import functools
 import pickle
+from typing import Any
 
 from .consts import (
     OP_GETATTR,
@@ -15,7 +16,10 @@ from .consts import (
     OP_PICKLE,
     OP_DIR,
     OP_INIT,
+    OP_SUBCLASSCHECK,
 )
+
+from .exception_transferer import ExceptionMetaClass
 
 DELETED_ATTRS = frozenset(["__array_struct__", "__array_interface__"])
 
@@ -26,8 +30,9 @@ LOCAL_ATTRS = (
             "___remote_class_name___",
             "___identifier___",
             "___connection___",
-            "___refcount___",
-            "___local_overrides___"
+            "___local_overrides___",
+            "___is_returned_exception___",
+            "___exception_attributes___",
             "__class__",
             "__init__",
             "__del__",
@@ -38,9 +43,11 @@ LOCAL_ATTRS = (
             "__getattribute__",
             "__hash__",
             "__instancecheck__",
+            "__subclasscheck__",
             "__init__",
             "__metaclass__",
             "__module__",
+            "__name__",
             "__new__",
             "__reduce__",
             "__reduce_ex__",
@@ -61,23 +68,27 @@ NORMAL_METHOD = 0
 STATIC_METHOD = 1
 CLASS_METHOD = 2
 
+
 def fwd_request(stub, request_type, *args, **kwargs):
     connection = object.__getattribute__(stub, "___connection___")
-    return connection.stub_request(stub, request_type, *args, **kwargs)
+    if connection:
+        return connection.stub_request(stub, request_type, *args, **kwargs)
+    raise RuntimeError(
+        "Returned exception stub cannot be used to make further remote requests"
+    )
 
 
 class StubMetaClass(type):
-    __slots__ = ()
-
-    def __repr__(self):
-        if self.__module__:
-            return "<stub class '%s.%s'>" % (self.__module__, self.__name__)
+    def __repr__(cls):
+        if cls.__module__:
+            return "<stub class '%s.%s'>" % (cls.__module__, cls.__name__)
         else:
-            return "<stub class '%s'>" % (self.__name__,)
+            return "<stub class '%s'>" % (cls.__name__,)
 
 
 def with_metaclass(meta, *bases):
     """Create a base class with a metaclass."""
+
     # Compatibility 2/3. Remove when only 3 support
     class metaclass(type):
         def __new__(cls, name, this_bases, d):
@@ -94,29 +105,25 @@ class Stub(with_metaclass(StubMetaClass, object)):
     happen on the remote side (server).
     """
 
-    __slots__ = [
-        "___remote_class_name___",
-        "___identifier___",
-        "___connection___",
-        "__weakref__",
-        "___refcount___",
-    ]
-
+    __slots__ = ()
     # def __iter__(self):  # FIXME: Keep debugger QUIET!!
     #    raise AttributeError
 
-    def __init__(self, connection, remote_class_name, identifier):
+    def __init__(
+        self, connection, remote_class_name, identifier, _is_returned_exception=False
+    ):
         self.___remote_class_name___ = remote_class_name
         self.___identifier___ = identifier
         self.___connection___ = connection
-        self.___refcount___ = 1
+        # If it is a returned exception (ie: it was raised by the server), it behaves
+        # a bit differently for methods like __str__ and __repr__ (we try not to get
+        # stuff from the server)
+        self.___is_returned_exception___ = _is_returned_exception
 
     def __del__(self):
         try:
-            pass
-            self.___refcount___ -= 1
-            if self.___refcount___ == 0:
-               fwd_request(self, OP_DEL)
+            if not self.___is_returned_exception___:
+                fwd_request(self, OP_DEL)
         except Exception:
             # raised in a destructor, most likely on program termination,
             # when the connection might have already been closed.
@@ -125,9 +132,7 @@ class Stub(with_metaclass(StubMetaClass, object)):
 
     def __getattribute__(self, name):
         if name in LOCAL_ATTRS:
-            if name == "__class__":
-                return None
-            elif name == "__doc__":
+            if name == "__doc__":
                 return self.__getattr__("__doc__")
             elif name in DELETED_ATTRS:
                 raise AttributeError()
@@ -141,7 +146,7 @@ class Stub(with_metaclass(StubMetaClass, object)):
             return object.__getattribute__(self, name)
 
     def __getattr__(self, name):
-        if name in DELETED_ATTRS:
+        if name in DELETED_ATTRS or self.___is_returned_exception___:
             raise AttributeError()
         return fwd_request(self, OP_GETATTR, name)
 
@@ -149,12 +154,20 @@ class Stub(with_metaclass(StubMetaClass, object)):
         if name in LOCAL_ATTRS:
             object.__delattr__(self, name)
         else:
+            if self.___is_returned_exception___:
+                raise AttributeError()
             return fwd_request(self, OP_DELATTR, name)
 
     def __setattr__(self, name, value):
-        if name in LOCAL_ATTRS or name in self.___local_overrides___:
+        if (
+            name in LOCAL_ATTRS
+            or name in self.___local_overrides___
+            or self.___is_returned_exception___
+        ):
             object.__setattr__(self, name, value)
         else:
+            if self.___is_returned_exception___:
+                raise AttributeError()
             fwd_request(self, OP_SETATTR, name, value)
 
     def __dir__(self):
@@ -164,9 +177,13 @@ class Stub(with_metaclass(StubMetaClass, object)):
         return fwd_request(self, OP_HASH)
 
     def __repr__(self):
+        if self.___is_returned_exception___:
+            return self.__exception_repr__()
         return fwd_request(self, OP_REPR)
 
     def __str__(self):
+        if self.___is_returned_exception___:
+            return self.__exception_str__()
         return fwd_request(self, OP_STR)
 
     def __exit__(self, exc, typ, tb):
@@ -177,6 +194,16 @@ class Stub(with_metaclass(StubMetaClass, object)):
     def __reduce_ex__(self, proto):
         # support for pickling
         return pickle.loads, (fwd_request(self, OP_PICKLE, proto),)
+
+    @classmethod
+    def __subclasshook__(cls, parent):
+        if parent.__bases__[0] == Stub:
+            raise NotImplementedError  # Follow the usual mechanism
+        # If this is not a stub, we go over to the other side
+        parent_name = "%s.%s" % (parent.__module__, parent.__name__)
+        return cls.___class_connection___.stub_request(
+            None, OP_SUBCLASSCHECK, cls.___class_remote_class_name___, parent_name, True
+        )
 
 
 def _make_method(method_type, connection, class_name, name, doc):
@@ -193,11 +220,13 @@ def _make_method(method_type, connection, class_name, name, doc):
 
     def static_method(connection, class_name, name, *args, **kwargs):
         return connection.stub_request(
-            None, OP_CALLONCLASS, class_name, name, True, *args, **kwargs)
+            None, OP_CALLONCLASS, class_name, name, True, *args, **kwargs
+        )
 
     def class_method(connection, class_name, name, cls, *args, **kwargs):
         return connection.stub_request(
-            None, OP_CALLONCLASS, class_name, name, False, *args, **kwargs)
+            None, OP_CALLONCLASS, class_name, name, False, *args, **kwargs
+        )
 
     if method_type == NORMAL_METHOD:
         m = method
@@ -220,7 +249,7 @@ def _make_method(method_type, connection, class_name, name, doc):
 
 class MetaWithConnection(StubMetaClass):
     # The use of this metaclass is so that we can support two modes when
-    # instanciating a sub-class of Stub. Suppose we have a class Foo which is a stub.
+    # instantiating a subclass of Stub. Suppose we have a class Foo which is a stub.
     # There are two ways Foo is initialized:
     #  - when it is returned from the remote side, in which case we do
     #    Foo(class_name, connection, identifier)
@@ -232,7 +261,7 @@ class MetaWithConnection(StubMetaClass):
     # see if the first one is the connection which would indicate that we are in
     # the first case. If that is the case, we just pass everything down to the
     # super __call__ and go our merry way. If this is not the case, we will
-    # use the connection we saved when creating this meta class and call
+    # use the connection we saved when creating this metaclass and call
     # OP_INIT to create the object
 
     def __new__(cls, class_name, base_classes, class_dict, connection):
@@ -251,11 +280,98 @@ class MetaWithConnection(StubMetaClass):
                 None, OP_INIT, cls.___class_remote_class_name___, *args, **kwargs
             )
 
+    def __subclasscheck__(cls, subclass):
+        subclass_name = "%s.%s" % (subclass.__module__, subclass.__name__)
+        if subclass.__bases__[0] == Stub:
+            subclass_name = subclass.___class_remote_class_name___
+        return cls.___class_connection___.stub_request(
+            None,
+            OP_SUBCLASSCHECK,
+            cls.___class_remote_class_name___,
+            subclass_name,
+        )
 
-def create_class(connection, class_name, overriden_methods,
-                 getattr_overrides, setattr_overrides, class_methods):
+    def __instancecheck__(cls, instance):
+        if type(instance) == cls:
+            # Fast path if it's just an object of this class
+            return True
+        # Goes to __subclasscheck__ above
+        return cls.__subclasscheck__(type(instance))
 
-    class_dict = {"__slots__": ()}
+
+class MetaExceptionWithConnection(StubMetaClass, ExceptionMetaClass):
+    def __new__(cls, class_name, base_classes, class_dict, connection):
+        return type.__new__(cls, class_name, base_classes, class_dict)
+
+    def __init__(cls, class_name, base_classes, class_dict, connection):
+        cls.___class_remote_class_name___ = class_name
+        cls.___class_connection___ = connection
+
+        # We call the one on ExceptionMetaClass which does everything needed (StubMetaClass
+        # does not do anything special for init)
+        ExceptionMetaClass.__init__(cls, class_name, base_classes, class_dict)
+
+        # Restore __str__ and __repr__ to the original ones because we need to determine
+        # if we call them depending on whether or not the object is a returned exception
+        # or not
+        cls.__exception_str__ = cls.__str__
+        cls.__exception_repr__ = cls.__repr__
+        cls.__str__ = cls.__orig_str__
+        cls.__repr__ = cls.__orig_repr__
+
+    def __call__(cls, *args, **kwargs):
+        # Very similar to the other case but we also need to be able to detect
+        # local instantiation of an exception so that we can set the __is_returned_exception__
+        if len(args) > 0 and id(args[0]) == id(cls.___class_connection___):
+            return super(MetaExceptionWithConnection, cls).__call__(*args, **kwargs)
+        elif kwargs and kwargs.get("_is_returned_exception", False):
+            return super(MetaExceptionWithConnection, cls).__call__(
+                None, None, None, _is_returned_exception=True
+            )
+        else:
+            return cls.___class_connection___.stub_request(
+                None, OP_INIT, cls.___class_remote_class_name___, *args, **kwargs
+            )
+
+    # The issue is that for a proxied object that is also an exception, we now have
+    # two classes representing it, one that includes the Stub class and one that doesn't
+    # Concretely:
+    #  - test.MyException would return a class that derives from Stub
+    #  - test.MySubException would return a class that derives from Stub and test.MyException
+    #    but WITHOUT the Stub portion (see get_local_class).
+    #  - we want issubclass(test.MySubException, test.MyException) to return True and
+    #    the same with instance checks.
+    def __instancecheck__(cls, instance):
+        return cls.__subclasscheck__(type(instance))
+
+    def __subclasscheck__(cls, subclass):
+        # __mro__[0] is this class itself
+        # __mro__[1] is the stub so we start checking at 2
+        return any(
+            [
+                subclass.__mro__[i] in cls.__mro__[2:]
+                for i in range(2, len(subclass.__mro__))
+            ]
+        )
+
+
+def create_class(
+    connection,
+    class_name,
+    overriden_methods,
+    getattr_overrides,
+    setattr_overrides,
+    class_methods,
+    parents,
+):
+    class_dict = {
+        "__slots__": [
+            "___remote_class_name___",
+            "___identifier___",
+            "___connection___",
+            "___is_returned_exception___",
+        ]
+    }
     for name, doc in class_methods.items():
         method_type = NORMAL_METHOD
         if name.startswith("___s___"):
@@ -270,24 +386,32 @@ def create_class(connection, class_name, overriden_methods,
                     lambda override, orig_method: lambda obj, *args, **kwargs: override(
                         obj, functools.partial(orig_method, obj), *args, **kwargs
                     )
-                )(overriden_methods[name],
-                  _make_method(method_type, connection, class_name, name, doc))
+                )(
+                    overriden_methods[name],
+                    _make_method(method_type, connection, class_name, name, doc),
+                )
             elif method_type == STATIC_METHOD:
                 class_dict[name] = (
                     lambda override, orig_method: lambda *args, **kwargs: override(
                         orig_method, *args, **kwargs
                     )
-                )(overriden_methods[name],
-                  _make_method(method_type, connection, class_name, name, doc))
+                )(
+                    overriden_methods[name],
+                    _make_method(method_type, connection, class_name, name, doc),
+                )
             elif method_type == CLASS_METHOD:
                 class_dict[name] = (
                     lambda override, orig_method: lambda cls, *args, **kwargs: override(
                         cls, functools.partial(orig_method, cls), *args, **kwargs
                     )
-                )(overriden_methods[name],
-                  _make_method(method_type, connection, class_name, name, doc))
+                )(
+                    overriden_methods[name],
+                    _make_method(method_type, connection, class_name, name, doc),
+                )
         elif name not in LOCAL_ATTRS:
-            class_dict[name] = _make_method(method_type, connection, class_name, name, doc)
+            class_dict[name] = _make_method(
+                method_type, connection, class_name, name, doc
+            )
     # Check for any getattr/setattr overrides
     special_attributes = set(getattr_overrides.keys())
     special_attributes.update(set(setattr_overrides.keys()))
@@ -296,14 +420,50 @@ def create_class(connection, class_name, overriden_methods,
         getter = getattr_overrides.get(attr)
         setter = setattr_overrides.get(attr)
         if getter is not None:
-            getter = lambda x, name=attr, inner=getter: \
-                inner(x, name, lambda y=x, name=name: y.__getattr__(name))
+            getter = lambda x, name=attr, inner=getter: inner(
+                x, name, lambda y=x, name=name: y.__getattr__(name)
+            )
         if setter is not None:
-            setter = lambda x, value, name=attr, inner=setter: \
-                inner(x, name, \
-                      lambda val, y=x, name=name: fwd_request(y, OP_SETATTR, name, val),
-                      value)
+            setter = lambda x, value, name=attr, inner=setter: inner(
+                x,
+                name,
+                lambda val, y=x, name=name: fwd_request(y, OP_SETATTR, name, val),
+                value,
+            )
             overriden_attrs.add(attr)
         class_dict[attr] = property(getter, setter)
-    class_dict['___local_overrides___'] = overriden_attrs
-    return MetaWithConnection(class_name, (Stub,), class_dict, connection)
+    if parents:
+        # This means this is also an exception so we add a few more things to it
+        # so that it
+        # This is copied from ExceptionMetaClass in exception_transferer.py
+        for n in ("_exception_str", "_exception_repr", "_exception_tb"):
+            class_dict[n] = property(
+                lambda self, n=n: getattr(self, "%s_val" % n, "<missing>"),
+                lambda self, v, n=n: setattr(self, "%s_val" % n, v),
+            )
+
+        def _do_str(self):
+            text = self._exception_str
+            text += "\n\n===== Remote (on server) traceback =====\n"
+            text += self._exception_tb
+            text += "========================================\n"
+            return text
+
+        class_dict["__exception_str__"] = _do_str
+        class_dict["__exception_repr__"] = lambda self: self._exception_repr
+    else:
+        # If we are based on an exception, we already have __weakref__ so we don't add
+        # it but not the case if we are not.
+        class_dict["__slots__"].append("__weakref__")
+
+    class_module, class_name_only = class_name.rsplit(".", 1)
+    class_dict["___local_overrides___"] = overriden_attrs
+    class_dict["__module__"] = class_module
+    if parents:
+        to_return = MetaExceptionWithConnection(
+            class_name, (Stub, *parents), class_dict, connection
+        )
+    else:
+        to_return = MetaWithConnection(class_name, (Stub,), class_dict, connection)
+    to_return.__name__ = class_name_only
+    return to_return

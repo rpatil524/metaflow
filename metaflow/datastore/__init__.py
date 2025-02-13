@@ -1,7 +1,4 @@
-
-from . import local, s3
-from .datastore import Inputs, DataException, MetaflowDataStore
-from .datastore_set import MetaflowDatastoreSet
-
-DATASTORES = {'local': local.LocalDataStore,
-              's3': s3.S3DataStore}
+from .inputs import Inputs
+from .flow_datastore import FlowDataStore
+from .datastore_set import TaskDataStoreSet
+from .task_datastore import TaskDataStore

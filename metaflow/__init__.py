@@ -39,239 +39,157 @@ access results
 # More questions?
 
 If you have any questions, feel free to post a bug report/question on the
-Metaflow Github page.
+Metaflow GitHub page.
 """
 
-import importlib
+import os
 import sys
-import types
 
-if sys.version_info[0] >= 3 and sys.version_info[1] >= 4:
-    import importlib.util
-    from importlib.machinery import ModuleSpec
-else:
-    # Something random so there is no syntax error
-    ModuleSpec = None
-
-
-class _LazyLoader(object):
-    # This _LazyLoader implements the Importer Protocol defined in PEP 302
-    # TODO: Need to move to find_spec, exec_module and create_module as
-    # find_module and load_module are deprecated
-
-    def __init__(self, handled):
-        # Modules directly loaded (this is either new modules or overrides of existing ones)
-        self._handled = handled if handled else {}
-
-        # This is used to revert back to regular loading when trying to load
-        # the over-ridden module
-        self._tempexcluded = set()
-
-        # This is used when loading a module alias to load any submodule
-        self._alias_to_orig = {}
-
-    def find_module(self, fullname, path=None):
-        if fullname in self._tempexcluded:
-            return None
-        if fullname in self._handled or \
-                (fullname.endswith('._orig') and fullname[:-6] in self._handled):
-            return self
-        name_parts = fullname.split('.')
-        if len(name_parts) > 1 and name_parts[-1] != '_orig':
-            # We check if we had an alias created for this module and if so,
-            # we are going to load it to properly fully create aliases all
-            # the way down.
-            parent_name = '.'.join(name_parts[:-1])
-            if parent_name in self._alias_to_orig:
-                return self
-        return None
-
-    def load_module(self, fullname):
-        if fullname in sys.modules:
-            return sys.modules[fullname]
-        if not self._can_handle_orig_module() and fullname.endswith('._orig'):
-            # We return a nicer error message
-            raise ImportError(
-                "Attempting to load '%s' -- loading shadowed modules in Metaflow "
-                "Extensions are only supported in Python 3.4+" % fullname)
-        to_import = self._handled.get(fullname, None)
-
-        # If to_import is None, two cases:
-        #  - we are loading a ._orig module
-        #  - OR we are loading a submodule
-        if to_import is None:
-            if fullname.endswith('._orig'):
-                try:
-                    # We exclude this module temporarily from what we handle to
-                    # revert back to the non-shadowing mode of import
-                    self._tempexcluded.add(fullname)
-                    to_import = importlib.util.find_spec(fullname)
-                finally:
-                    self._tempexcluded.remove(fullname)
-            else:
-                name_parts = fullname.split('.')
-                submodule = name_parts[-1]
-                parent_name = '.'.join(name_parts[:-1])
-                to_import = '.'.join(
-                    [self._alias_to_orig[parent_name], submodule])
-
-        if isinstance(to_import, str):
-            try:
-                to_import_mod = importlib.import_module(to_import)
-            except ImportError:
-                raise ImportError(
-                    "No module found '%s' (aliasing %s)" % (fullname, to_import))
-            sys.modules[fullname] = to_import_mod
-            self._alias_to_orig[fullname] = to_import_mod.__name__
-        elif isinstance(to_import, types.ModuleType):
-            sys.modules[fullname] = to_import
-            self._alias_to_orig[fullname] = to_import.__name__
-        elif self._can_handle_orig_module() and isinstance(to_import, ModuleSpec):
-            # This loads modules that end in _orig
-            m = importlib.util.module_from_spec(to_import)
-            to_import.loader.exec_module(m)
-            sys.modules[fullname] = m
-        elif to_import is None and fullname.endswith('._orig'):
-            # This happens when trying to access a shadowed ._orig module
-            # when actually, there is no shadowed module; print a nicer message
-            # Condition is a bit overkill and most likely only checking to_import
-            # would be OK. Being extra sure in case _LazyLoader is misused and
-            # a None value is passed in.
-            raise ImportError(
-                "Metaflow Extensions shadowed module '%s' does not exist" % fullname)
-        else:
-            raise ImportError
-        return sys.modules[fullname]
-
-    @staticmethod
-    def _can_handle_orig_module():
-        return sys.version_info[0] >= 3 and sys.version_info[1] >= 4
+from metaflow.extension_support import (
+    alias_submodules,
+    get_modules,
+    lazy_load_aliases,
+    load_globals,
+    load_module,
+    EXT_PKG,
+    _ext_debug,
+)
 
 # We load the module overrides *first* explicitly. Non overrides can be loaded
 # in toplevel as well but these can be loaded first if needed. Note that those
 # modules should be careful not to include anything in Metaflow at their top-level
 # as it is likely to not work.
+_override_modules = []
+_tl_modules = []
 try:
-    import metaflow_extensions.toplevel.module_overrides as extension_module
-except ImportError as e:
-    ver = sys.version_info[0] * 10 + sys.version_info[1]
-    if ver >= 36:
-        # e.name is set to the name of the package that fails to load
-        # so don't error ONLY IF the error is importing this module (but do
-        # error if there is a transitive import error)
-        if not (isinstance(e, ModuleNotFoundError) and \
-                e.name in ['metaflow_extensions', 'metaflow_extensions.toplevel',
-                           'metaflow_extensions.toplevel.module_overrides']):
-            print(
-                "Cannot load metaflow_extensions top-level configuration -- "
-                "if you want to ignore, uninstall metaflow_extensions package")
-            raise
-else:
-    # We load only modules
-    lazy_load_custom_modules = {}
-    for n, o in extension_module.__dict__.items():
-        if isinstance(o, types.ModuleType) and o.__package__ and \
-                o.__package__.startswith('metaflow_extensions'):
-            lazy_load_custom_modules['metaflow.%s' % n] = o
-    if lazy_load_custom_modules:
-        # Prepend to make sure extensions package overrides things
-        sys.meta_path = [_LazyLoader(lazy_load_custom_modules)] + sys.meta_path
+    _modules_to_import = get_modules("toplevel")
 
-from .event_logger import EventLogger
+    for m in _modules_to_import:
+        override_module = m.module.__dict__.get("module_overrides", None)
+        if override_module is not None:
+            _override_modules.append(
+                ".".join([EXT_PKG, m.tl_package, "toplevel", override_module])
+            )
+        tl_module = m.module.__dict__.get("toplevel", None)
+        if tl_module is not None:
+            _tl_modules.append(
+                (
+                    m.package_name,
+                    ".".join([EXT_PKG, m.tl_package, "toplevel", tl_module]),
+                )
+            )
+    _ext_debug("Got overrides to load: %s" % _override_modules)
+    _ext_debug("Got top-level imports: %s" % str(_tl_modules))
+except Exception as e:
+    _ext_debug("Error in importing toplevel/overrides: %s" % e)
+
+# Load overrides now that we have them (in the proper order)
+for m in _override_modules:
+    extension_module = load_module(m)
+    if extension_module:
+        # We load only modules
+        tl_package = m.split(".")[1]
+        lazy_load_aliases(alias_submodules(extension_module, tl_package, None))
+
+# Utilities
+from .multicore_utils import parallel_imap_unordered, parallel_map
+from .metaflow_profile import profile
+
+# current runtime singleton
+from .metaflow_current import current
 
 # Flow spec
 from .flowspec import FlowSpec
-from .includefile import IncludeFile
-from .parameters import Parameter, JSONTypeClass
-JSONType = JSONTypeClass()
 
-# current runtime singleton
-from .current import current
+from .parameters import Parameter, JSONTypeClass, JSONType
+
+from .user_configs.config_parameters import Config, ConfigValue, config_expr
+from .user_configs.config_decorators import CustomFlowDecorator, CustomStepDecorator
 
 # data layer
-from .datatools import S3
+# For historical reasons, we make metaflow.plugins.datatools accessible as
+# metaflow.datatools. S3 is also a tool that has historically been available at the
+# top-level so keep as is.
+lazy_load_aliases({"metaflow.datatools": "metaflow.plugins.datatools"})
+from .plugins.datatools import S3
+
+# includefile
+from .includefile import IncludeFile
 
 # Decorators
 from .decorators import step, _import_plugin_decorators
+
 # this auto-generates decorator functions from Decorator objects
 # in the top-level metaflow namespace
 _import_plugin_decorators(globals())
+# Setting card import for only python 3.4
+if sys.version_info[0] >= 3 and sys.version_info[1] >= 4:
+    from . import cards
 
 # Client
-from .client import namespace,\
-                    get_namespace,\
-                    default_namespace,\
-                    metadata, \
-                    get_metadata, \
-                    default_metadata, \
-                    Metaflow,\
-                    Flow,\
-                    Run,\
-                    Step,\
-                    Task,\
-                    DataArtifact
+from .client import (
+    namespace,
+    get_namespace,
+    default_namespace,
+    metadata,
+    get_metadata,
+    default_metadata,
+    Metaflow,
+    Flow,
+    Run,
+    Step,
+    Task,
+    DataArtifact,
+)
 
-# Utilities
-from .multicore_utils import parallel_imap_unordered,\
-                             parallel_map
-from .metaflow_profile import profile
+# Import data class within tuple_util but not introduce new symbols.
+from . import tuple_util
 
-# Now override everything other than modules
-__version_addl__ = None
-try:
-    import metaflow_extensions.toplevel.toplevel as extension_module
-except ImportError as e:
-    ver = sys.version_info[0] * 10 + sys.version_info[1]
-    if ver >= 36:
-        # e.name is set to the name of the package that fails to load
-        # so don't error ONLY IF the error is importing this module (but do
-        # error if there is a transitive import error)
-        if not (isinstance(e, ModuleNotFoundError) and \
-                e.name in ['metaflow_extensions', 'metaflow_extensions.toplevel',
-                           'metaflow_extensions.toplevel.toplevel']):
-            print(
-                "Cannot load metaflow_extensions top-level configuration -- "
-                "if you want to ignore, uninstall metaflow_extensions package")
-            raise
-else:
-    # We load into globals whatever we have in extension_module
-    # We specifically exclude any modules that may be included (like sys, os, etc)
-    # *except* for ones that are part of metaflow_extensions (basically providing
-    # an aliasing mechanism)
-    lazy_load_custom_modules = {}
-    addl_modules = extension_module.__dict__.get('__mf_promote_submodules__')
-    if addl_modules:
-        # We make an alias for these modules which the metaflow_extensions author
-        # wants to expose but that may not be loaded yet
-        lazy_load_custom_modules = {
-            'metaflow.%s' % k: 'metaflow_extensions.%s' % k for k in addl_modules}
-    for n, o in extension_module.__dict__.items():
-        if not n.startswith('__') and not isinstance(o, types.ModuleType):
-            globals()[n] = o
-        elif isinstance(o, types.ModuleType) and o.__package__ and \
-                o.__package__.startswith('metaflow_extensions'):
-            lazy_load_custom_modules['metaflow.%s' % n] = o
-    if lazy_load_custom_modules:
-        # Prepend to make sure custom package overrides things
-        sys.meta_path = [_LazyLoader(lazy_load_custom_modules)] + sys.meta_path
+# Runner API
+if sys.version_info >= (3, 7):
+    from .runner.metaflow_runner import Runner
+    from .runner.nbrun import NBRunner
+    from .runner.deployer import Deployer
+    from .runner.deployer import DeployedFlow
+    from .runner.nbdeploy import NBDeployer
 
-    __version_addl__ = getattr(extension_module, '__mf_extensions__', '<unk>')
-    if extension_module.__version__:
-        __version_addl__ = '%s(%s)' % (__version_addl__, extension_module.__version__)
+__ext_tl_modules__ = []
+_ext_debug("Loading top-level modules")
+for pkg_name, m in _tl_modules:
+    extension_module = load_module(m)
+    if extension_module:
+        tl_package = m.split(".")[1]
+        load_globals(extension_module, globals(), extra_indent=True)
+        lazy_load_aliases(
+            alias_submodules(extension_module, tl_package, None, extra_indent=True)
+        )
+        __ext_tl_modules__.append((pkg_name, extension_module))
 
 # Erase all temporary names to avoid leaking things
-for _n in ['ver', 'n', 'o', 'e', 'lazy_load_custom_modules',
-            'extension_module', 'addl_modules']:
+for _n in [
+    "_ext_debug",
+    "alias_submodules",
+    "get_modules",
+    "lazy_load_aliases",
+    "load_globals",
+    "load_module",
+    EXT_PKG,
+    "_override_modules",
+    "_tl_modules",
+    "_modules_to_import",
+    "m",
+    "override_module",
+    "tl_module",
+    "extension_module",
+    "tl_package",
+    "version_info",
+]:
     try:
         del globals()[_n]
     except KeyError:
         pass
-del globals()['_n']
+del globals()["_n"]
 
-import pkg_resources
-try:
-    __version__ = pkg_resources.get_distribution('metaflow').version
-except:
-    # this happens on remote environments since the job package
-    # does not have a version
-    __version__ = None
+from .version import metaflow_version as _mf_version
+
+__version__ = _mf_version

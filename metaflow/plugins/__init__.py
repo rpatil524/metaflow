@@ -1,192 +1,253 @@
 import sys
-import types
 
-_expected_extensions = {
-    'FLOW_DECORATORS': [],
-    'STEP_DECORATORS': [],
-    'ENVIRONMENTS': [],
-    'METADATA_PROVIDERS': [],
-    'SIDECARS': {},
-    'LOGGING_SIDECARS': {},
-    'MONITOR_SIDECARS': {},
-    'AWS_CLIENT_PROVIDERS': [],
-    'get_plugin_cli': lambda : []
-}
+from metaflow.extension_support.plugins import (
+    merge_lists,
+    process_plugins,
+    resolve_plugins,
+)
 
-try:
-    import metaflow_extensions.plugins as _ext_plugins
-except ImportError as e:
-    ver = sys.version_info[0] * 10 + sys.version_info[1]
-    if ver >= 36:
-        # e.name is set to the name of the package that fails to load
-        # so don't error ONLY IF the error is importing this module (but do
-        # error if there is a transitive import error)
-        if not (isinstance(e, ModuleNotFoundError) and \
-                e.name in ['metaflow_extensions', 'metaflow_extensions.plugins']):
-            print(
-                "Cannot load metaflow_extensions plugins -- "
-                "if you want to ignore, uninstall metaflow_extensions package")
-            raise
-    class _fake(object):
-        def __getattr__(self, name):
-            if name in _expected_extensions:
-                return _expected_extensions[name]
-            raise AttributeError
+# Add new CLI commands here
+CLIS_DESC = [
+    ("package", ".package_cli.cli"),
+    ("batch", ".aws.batch.batch_cli.cli"),
+    ("kubernetes", ".kubernetes.kubernetes_cli.cli"),
+    ("step-functions", ".aws.step_functions.step_functions_cli.cli"),
+    ("airflow", ".airflow.airflow_cli.cli"),
+    ("argo-workflows", ".argo.argo_workflows_cli.cli"),
+    ("card", ".cards.card_cli.cli"),
+    ("tag", ".tag_cli.cli"),
+    ("spot-metadata", ".kubernetes.spot_metadata_cli.cli"),
+    ("logs", ".logs_cli.cli"),
+]
 
-    _ext_plugins = _fake()
-else:
-    # We load into globals whatever we have in extension_module
-    # We specifically exclude any modules that may be included (like sys, os, etc)
-    # *except* for ones that are part of metaflow_extensions (basically providing
-    # an aliasing mechanism)
-    lazy_load_custom_modules = {}
-    addl_modules = _ext_plugins.__dict__.get('__mf_promote_submodules__')
-    if addl_modules:
-        # We make an alias for these modules which the metaflow_extensions author
-        # wants to expose but that may not be loaded yet
-        lazy_load_custom_modules = {
-            'metaflow.plugins.%s' % k: 'metaflow_extensions.plugins.%s' % k
-            for k in addl_modules}
-    for n, o in _ext_plugins.__dict__.items():
-        if not n.startswith('__') and not isinstance(o, types.ModuleType):
-            globals()[n] = o
-        elif isinstance(o, types.ModuleType) and o.__package__ and \
-                o.__package__.startswith('metaflow_extensions'):
-            lazy_load_custom_modules['metaflow.plugins.%s' % n] = o
-    if lazy_load_custom_modules:
-        # NOTE: We load things first to have metaflow_extensions override things here.
-        # This does mean that for modules that have the same name (for example,
-        # if metaflow_extensions.plugins also provides a conda module), it needs
-        # to provide whatever is expected below (so for example a `conda_step_decorator`
-        # file with a `CondaStepDecorator` class).
-        # We do this because we want metaflow_extensions to fully override things
-        # and if we did not change sys.meta_path here, the lines below would
-        # load the non metaflow_extensions modules providing for possible confusion.
-        # This keeps it cleaner.
-        from metaflow import _LazyLoader
-        sys.meta_path = [_LazyLoader(lazy_load_custom_modules)] + sys.meta_path
-    
-    class _wrap(object):
-        def __init__(self, obj):
-            self.__dict__ = obj.__dict__
-
-        def __getattr__(self, name):
-            if name in _expected_extensions:
-                return _expected_extensions[name]
-            raise AttributeError
-
-    _ext_plugins = _wrap(_ext_plugins)
+# Add additional commands to the runner here
+# These will be accessed using Runner().<command>()
+RUNNER_CLIS_DESC = []
 
 
+from .test_unbounded_foreach_decorator import InternalTestUnboundedForeachInput
 
-def get_plugin_cli():
-    # it is important that CLIs are not imported when
-    # __init__ is imported. CLIs may use e.g.
-    # parameters.add_custom_parameters which requires
-    # that the flow is imported first
+# Add new step decorators here
+STEP_DECORATORS_DESC = [
+    ("catch", ".catch_decorator.CatchDecorator"),
+    ("timeout", ".timeout_decorator.TimeoutDecorator"),
+    ("environment", ".environment_decorator.EnvironmentDecorator"),
+    ("secrets", ".secrets.secrets_decorator.SecretsDecorator"),
+    ("parallel", ".parallel_decorator.ParallelDecorator"),
+    ("retry", ".retry_decorator.RetryDecorator"),
+    ("resources", ".resources_decorator.ResourcesDecorator"),
+    ("batch", ".aws.batch.batch_decorator.BatchDecorator"),
+    ("kubernetes", ".kubernetes.kubernetes_decorator.KubernetesDecorator"),
+    (
+        "argo_workflows_internal",
+        ".argo.argo_workflows_decorator.ArgoWorkflowsInternalDecorator",
+    ),
+    (
+        "step_functions_internal",
+        ".aws.step_functions.step_functions_decorator.StepFunctionsInternalDecorator",
+    ),
+    (
+        "unbounded_test_foreach_internal",
+        ".test_unbounded_foreach_decorator.InternalTestUnboundedForeachDecorator",
+    ),
+    ("card", ".cards.card_decorator.CardDecorator"),
+    ("pytorch_parallel", ".frameworks.pytorch.PytorchParallelDecorator"),
+    ("airflow_internal", ".airflow.airflow_decorator.AirflowInternalDecorator"),
+    ("pypi", ".pypi.pypi_decorator.PyPIStepDecorator"),
+    ("conda", ".pypi.conda_decorator.CondaStepDecorator"),
+]
 
-    # Add new CLI commands in this list
-    from . import package_cli
-    from .aws.batch import batch_cli
-    from .aws.step_functions import step_functions_cli
-
-    return _ext_plugins.get_plugin_cli() + [
-        package_cli.cli,
-        batch_cli.cli,
-        step_functions_cli.cli]
-
-
-def _merge_lists(base, overrides, attr):
-    # Merge two lists of classes by comparing them for equality using 'attr'.
-    # This function prefers anything in 'overrides'. In other words, if a class
-    # is present in overrides and matches (according to the equality criterion) a class in
-    # base, it will be used instead of the one in base.
-    l = list(overrides)
-    existing = set([getattr(o, attr) for o in overrides])
-    l.extend([d for d in base if getattr(d, attr) not in existing])
-    return l
-
-# Add new decorators in this list
-from .catch_decorator import CatchDecorator
-from .timeout_decorator import TimeoutDecorator
-from .environment_decorator import EnvironmentDecorator
-from .retry_decorator import RetryDecorator
-from .resources_decorator import ResourcesDecorator
-from .aws.batch.batch_decorator import BatchDecorator
-from .aws.step_functions.step_functions_decorator \
-                import StepFunctionsInternalDecorator
-from .test_unbounded_foreach_decorator\
-    import InternalTestUnboundedForeachDecorator, InternalTestUnboundedForeachInput
-from .conda.conda_step_decorator import CondaStepDecorator
-
-STEP_DECORATORS = _merge_lists([CatchDecorator,
-                                TimeoutDecorator,
-                                EnvironmentDecorator,
-                                ResourcesDecorator,
-                                RetryDecorator,
-                                BatchDecorator,
-                                StepFunctionsInternalDecorator,
-                                CondaStepDecorator,
-                                InternalTestUnboundedForeachDecorator],
-                                    _ext_plugins.STEP_DECORATORS, 'name')
-
-# Add Conda environment
-from .conda.conda_environment import CondaEnvironment
-ENVIRONMENTS = _merge_lists([CondaEnvironment], _ext_plugins.ENVIRONMENTS, 'TYPE')
-
-# Metadata providers
-from .metadata import LocalMetadataProvider, ServiceMetadataProvider
-
-METADATA_PROVIDERS = _merge_lists(
-    [LocalMetadataProvider, ServiceMetadataProvider], _ext_plugins.METADATA_PROVIDERS, 'TYPE')
-
-# Every entry in this list becomes a class-level flow decorator.
+# Add new flow decorators here
+# Every entry here becomes a class-level flow decorator.
 # Add an entry here if you need a new flow-level annotation. Be
 # careful with the choice of name though - they become top-level
 # imports from the metaflow package.
-from .conda.conda_flow_decorator import CondaFlowDecorator
-from .aws.step_functions.schedule_decorator import ScheduleDecorator
-from .project_decorator import ProjectDecorator
-FLOW_DECORATORS = _merge_lists([CondaFlowDecorator,
-                                ScheduleDecorator,
-                                ProjectDecorator],
-                            _ext_plugins.FLOW_DECORATORS, 'name')
+FLOW_DECORATORS_DESC = [
+    ("schedule", ".aws.step_functions.schedule_decorator.ScheduleDecorator"),
+    ("project", ".project_decorator.ProjectDecorator"),
+    ("trigger", ".events_decorator.TriggerDecorator"),
+    ("trigger_on_finish", ".events_decorator.TriggerOnFinishDecorator"),
+    ("pypi_base", ".pypi.pypi_decorator.PyPIFlowDecorator"),
+    ("conda_base", ".pypi.conda_decorator.CondaFlowDecorator"),
+]
+
+# Add environments here
+ENVIRONMENTS_DESC = [
+    ("conda", ".pypi.conda_environment.CondaEnvironment"),
+    ("pypi", ".pypi.pypi_environment.PyPIEnvironment"),
+]
+
+# Add metadata providers here
+METADATA_PROVIDERS_DESC = [
+    ("service", ".metadata_providers.service.ServiceMetadataProvider"),
+    ("local", ".metadata_providers.local.LocalMetadataProvider"),
+]
+
+# Add datastore here
+DATASTORES_DESC = [
+    ("local", ".datastores.local_storage.LocalStorage"),
+    ("s3", ".datastores.s3_storage.S3Storage"),
+    ("azure", ".datastores.azure_storage.AzureStorage"),
+    ("gs", ".datastores.gs_storage.GSStorage"),
+]
+
+# Dataclients are used for IncludeFile
+DATACLIENTS_DESC = [
+    ("local", ".datatools.Local"),
+    ("s3", ".datatools.S3"),
+    ("azure", ".azure.includefile_support.Azure"),
+    ("gs", ".gcp.includefile_support.GS"),
+]
+
+# Add non monitoring/logging sidecars here
+SIDECARS_DESC = [
+    (
+        "save_logs_periodically",
+        "..mflog.save_logs_periodically.SaveLogsPeriodicallySidecar",
+    ),
+    (
+        "spot_termination_monitor",
+        ".kubernetes.spot_monitor_sidecar.SpotTerminationMonitorSidecar",
+    ),
+    ("heartbeat", "metaflow.metadata_provider.heartbeat.MetadataHeartBeat"),
+]
+
+# Add logging sidecars here
+LOGGING_SIDECARS_DESC = [
+    ("debugLogger", ".debug_logger.DebugEventLogger"),
+    ("nullSidecarLogger", "metaflow.event_logger.NullEventLogger"),
+]
+
+# Add monitor sidecars here
+MONITOR_SIDECARS_DESC = [
+    ("debugMonitor", ".debug_monitor.DebugMonitor"),
+    ("nullSidecarMonitor", "metaflow.monitor.NullMonitor"),
+]
+
+# Add AWS client providers here
+AWS_CLIENT_PROVIDERS_DESC = [("boto3", ".aws.aws_client.Boto3ClientProvider")]
+
+# Add Airflow sensor related flow decorators
+SENSOR_FLOW_DECORATORS = [
+    ("airflow_external_task_sensor", ".airflow.sensors.ExternalTaskSensorDecorator"),
+    ("airflow_s3_key_sensor", ".airflow.sensors.S3KeySensorDecorator"),
+]
+
+FLOW_DECORATORS_DESC += SENSOR_FLOW_DECORATORS
+
+SECRETS_PROVIDERS_DESC = [
+    ("inline", ".secrets.inline_secrets_provider.InlineSecretsProvider"),
+    (
+        "aws-secrets-manager",
+        ".aws.secrets_manager.aws_secrets_manager_secrets_provider.AwsSecretsManagerSecretsProvider",
+    ),
+    (
+        "gcp-secret-manager",
+        ".gcp.gcp_secret_manager_secrets_provider.GcpSecretManagerSecretsProvider",
+    ),
+    (
+        "az-key-vault",
+        ".azure.azure_secret_manager_secrets_provider.AzureKeyVaultSecretsProvider",
+    ),
+]
+
+GCP_CLIENT_PROVIDERS_DESC = [
+    ("gcp-default", ".gcp.gs_storage_client_factory.GcpDefaultClientProvider")
+]
+
+AZURE_CLIENT_PROVIDERS_DESC = [
+    ("azure-default", ".azure.azure_credential.AzureDefaultClientProvider")
+]
+
+DEPLOYER_IMPL_PROVIDERS_DESC = [
+    ("argo-workflows", ".argo.argo_workflows_deployer.ArgoWorkflowsDeployer"),
+    (
+        "step-functions",
+        ".aws.step_functions.step_functions_deployer.StepFunctionsDeployer",
+    ),
+]
+
+process_plugins(globals())
 
 
-# Sidecars
-from ..mflog.save_logs_periodically import SaveLogsPeriodicallySidecar
-from metaflow.metadata.heartbeat import MetadataHeartBeat
+def get_plugin_cli():
+    return resolve_plugins("cli")
 
-SIDECARS = {'save_logs_periodically': SaveLogsPeriodicallySidecar,
-            'heartbeat': MetadataHeartBeat}
-SIDECARS.update(_ext_plugins.SIDECARS)
 
-# Add logger
-from .debug_logger import DebugEventLogger
-LOGGING_SIDECARS = {'debugLogger': DebugEventLogger,
-                    'nullSidecarLogger': None}
-LOGGING_SIDECARS.update(_ext_plugins.LOGGING_SIDECARS)
+def get_plugin_cli_path():
+    return resolve_plugins("cli", path_only=True)
 
-# Add monitor
-from .debug_monitor import DebugMonitor
-MONITOR_SIDECARS = {'debugMonitor': DebugMonitor,
-                    'nullSidecarMonitor': None}
-MONITOR_SIDECARS.update(_ext_plugins.MONITOR_SIDECARS)
+
+def get_runner_cli():
+    return resolve_plugins("runner_cli")
+
+
+def get_runner_cli_path():
+    return resolve_plugins("runner_cli", path_only=True)
+
+
+STEP_DECORATORS = resolve_plugins("step_decorator")
+FLOW_DECORATORS = resolve_plugins("flow_decorator")
+ENVIRONMENTS = resolve_plugins("environment")
+METADATA_PROVIDERS = resolve_plugins("metadata_provider")
+DATASTORES = resolve_plugins("datastore")
+DATACLIENTS = resolve_plugins("dataclient")
+SIDECARS = resolve_plugins("sidecar")
+LOGGING_SIDECARS = resolve_plugins("logging_sidecar")
+MONITOR_SIDECARS = resolve_plugins("monitor_sidecar")
 
 SIDECARS.update(LOGGING_SIDECARS)
 SIDECARS.update(MONITOR_SIDECARS)
 
-from .aws.aws_client import Boto3ClientProvider
-AWS_CLIENT_PROVIDERS = _merge_lists(
-    [Boto3ClientProvider], _ext_plugins.AWS_CLIENT_PROVIDERS, 'name')
+AWS_CLIENT_PROVIDERS = resolve_plugins("aws_client_provider")
+SECRETS_PROVIDERS = resolve_plugins("secrets_provider")
+AZURE_CLIENT_PROVIDERS = resolve_plugins("azure_client_provider")
+GCP_CLIENT_PROVIDERS = resolve_plugins("gcp_client_provider")
 
-# Erase all temporary names to avoid leaking things
-# We leave '_ext_plugins' and '_expected_extensions' because they are used in
-# a function (so they need to stick around)
-for _n in ['ver', 'n', 'o', 'e', 'lazy_load_custom_modules', '_LazyLoader',
-           '_merge_lists', '_fake', '_wrap', 'addl_modules']:
-    try:
-        del globals()[_n]
-    except KeyError:
-        pass
-del globals()['_n']
+if sys.version_info >= (3, 7):
+    DEPLOYER_IMPL_PROVIDERS = resolve_plugins("deployer_impl_provider")
+
+from .cards.card_modules import MF_EXTERNAL_CARDS
+
+# Cards; due to the way cards were designed, it is harder to make them fit
+# in the resolve_plugins mechanism. This should be OK because it is unlikely that
+# cards will need to be *removed*. No card should be too specific (for example, no
+# card should be something just for Airflow, or Argo or step-functions -- those should
+# be added externally).
+from .cards.card_modules.basic import (
+    BlankCard,
+    DefaultCard,
+    DefaultCardJSON,
+    ErrorCard,
+    TaskSpecCard,
+)
+from .cards.card_modules.test_cards import (
+    TestEditableCard,
+    TestEditableCard2,
+    TestErrorCard,
+    TestMockCard,
+    TestNonEditableCard,
+    TestPathSpecCard,
+    TestTimeoutCard,
+    TestRefreshCard,
+    TestRefreshComponentCard,
+)
+
+CARDS = [
+    DefaultCard,
+    TaskSpecCard,
+    ErrorCard,
+    BlankCard,
+    TestErrorCard,
+    TestTimeoutCard,
+    TestMockCard,
+    TestPathSpecCard,
+    TestEditableCard,
+    TestEditableCard2,
+    TestNonEditableCard,
+    BlankCard,
+    DefaultCardJSON,
+    TestRefreshCard,
+    TestRefreshComponentCard,
+]
+merge_lists(CARDS, MF_EXTERNAL_CARDS, "type")
